@@ -31,6 +31,11 @@
     <script src="~/vendor/vue-qrcode-reader/VueQrcodeReader.umd.min.js" asp-append-version="true"></script>
 
     <script>
+        // A PSBT announces itself with its own magic bytes, so whatever the camera
+        // decoded — a static QR, a BBQr of either type, a UR — can be put in the box
+        // it belongs in rather than the box that happens to be first.
+        const PSBT_MAGIC = "70736274ff";
+        const isPSBT = value => typeof value === "string" && value.trim().toLowerCase().startsWith(PSBT_MAGIC);
         hljs.initHighlightingOnLoad();
 
         document.addEventListener("DOMContentLoaded", () => {
@@ -64,12 +69,20 @@
                         hex = psbt.getPSBT().toString('hex');
                     } else {
                         console.error('Unexpected UR type', data.type)
+                        return;
                     }
                 } else if (typeof(data) === 'string') {
                     hex = data;
+                } else {
+                    return;
                 }
-                document.getElementById("ImportedPSBT").value = hex;
-                document.getElementsByClassName("camera-submit")[0].click();
+                if (isPSBT(hex)) {
+                    document.getElementById("ImportedPSBT").value = hex;
+                    document.getElementsByClassName("camera-submit")[0].click();
+                } else {
+                    document.getElementById("ImportedTransaction").value = hex;
+                    document.getElementsByClassName("camera-submit-tx")[0].click();
+                }
             }, "scanModal");
         });
     </script>
@@ -84,6 +97,13 @@
 </header>
 
 <partial name="_PSBTInfo" model="Model" />
+
+@if (Model.ProvidedTransaction)
+{
+    <div class="alert alert-info mt-3" role="alert" text-translate="true">
+        This was read as a signed transaction rather than a PSBT. There is nothing left to sign; it can only be broadcast as it stands.
+    </div>
+}
 
 @if (isSignable)
 {
@@ -177,6 +197,7 @@ else
                                 <li class="nav-item" role="presentation">
                                     <button class="btcpay-pill" id="export-json-tab" data-bs-toggle="pill" data-bs-target="#export-json" type="button" role="tab" aria-controls="export-json" aria-selected="false">JSON</button>
                                 </li>
+
                             </ul>
                             <div class="tab-content" id="export-tabContent">
                                 <div class="tab-pane fade show active" id="export-base64" role="tabpanel" aria-labelledby="export-base64-tab">
@@ -188,12 +209,47 @@ else
                                 <div class="tab-pane fade" id="export-json" role="tabpanel" aria-labelledby="export-json-tab">
                                     <pre class="mb-0"><code class="json">@Model.Decoded</code></pre>
                                 </div>
+
                             </div>
                         </div>
                     </div>
                 </div>
             </div>
     </div>
+    @if (Model.TransactionHex is not null)
+    {
+        @* The transaction a complete PSBT would broadcast. Not a PSBT: no signer takes
+           it, and a node, a block explorer or another wallet's broadcast box does. *@
+        <div class="accordion-item" permission="@WalletPolicies.CanSignWalletTransactions">
+            <h2 class="accordion-header" id="TransactionOptionsExportHeader">
+                <button type="button" class="accordion-button collapsed" data-bs-toggle="collapse" data-bs-target="#TransactionOptionsExportContent" aria-controls="TransactionOptionsExportContent" aria-expanded="false">
+                    <span class="h5" text-translate="true">Export transaction</span>
+                    <vc:icon symbol="caret-down" />
+                </button>
+            </h2>
+            <div id="TransactionOptionsExportContent" class="accordion-collapse collapse" aria-labelledby="TransactionOptionsExportHeader" data-bs-parent="#PSBTOptions">
+                <div class="accordion-body">
+                    <form method="post" asp-action="WalletPSBT" asp-route-walletId="@walletId" class="mb-2">
+                        <input type="hidden" asp-for="CryptoCode" />
+                        <input type="hidden" asp-for="PSBT" />
+                        <input type="hidden" asp-for="ReturnUrl" />
+                        <input type="hidden" asp-for="BackUrl" />
+                        <p class="mb-2" text-translate="true">This transaction is fully signed. Broadcasting it anywhere, by any route, spends these inputs.</p>
+                        <div class="d-flex flex-column flex-sm-row flex-wrap align-items-sm-center">
+                            <button id="DownloadTransaction" name="command" type="submit" class="btn btn-primary mb-3 mb-sm-0 me-sm-2" value="save-tx" text-translate="true">Download transaction file</button>
+                            <a id="ShowTransactionHex" href="#TransactionHexOptions" data-bs-toggle="collapse" class="btn btn-link text-secondary" text-translate="true">Show raw version</a>
+                        </div>
+                    </form>
+                    <div id="TransactionHexOptions" class="collapse">
+                        <div class="pt-4">
+                            <p class="mb-2 text-secondary">@Model.TransactionId</p>
+                            <pre class="mb-0 text-wrap"><code class="text" id="transaction-hex">@Model.TransactionHex</code></pre>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    }
     @if (!isReady)
     {
         <div class="accordion-item" permission="@WalletPolicies.CanSignWalletTransactions">
@@ -228,6 +284,39 @@ else
                             }
                             <button type="button" id="scanqrcode" class="btn btn-primary only-for-js" data-bs-toggle="modal" data-bs-target="#scanModal" text-translate="true">Scan wallet QR with camera</button>
                         </div>
+                    </form>
+                </div>
+            </div>
+        </div>
+    }
+    @if (!isReady)
+    {
+        <div class="accordion-item" permission="@WalletPolicies.CanSignWalletTransactions">
+            <h2 class="accordion-header" id="TransactionOptionsImportHeader">
+                <button type="button" class="accordion-button collapsed" data-bs-toggle="collapse" data-bs-target="#TransactionOptionsImportContent" aria-controls="TransactionOptionsImportContent" aria-expanded="false">
+                    <span class="h5" text-translate="true">Provide signed transaction</span>
+                    <vc:icon symbol="caret-down" />
+                </button>
+            </h2>
+            <div id="TransactionOptionsImportContent" class="accordion-collapse collapse" aria-labelledby="TransactionOptionsImportHeader" data-bs-parent="#PSBTOptions">
+                <div class="accordion-body">
+                    <form method="post" asp-action="WalletPSBT" asp-route-walletId="@walletId" enctype="multipart/form-data" class="mb-2">
+                        <input type="hidden" asp-for="ReturnUrl" />
+                        <input type="hidden" asp-for="BackUrl" />
+                        @* The context is carried so a comment, a payjoin or a pending
+                           transaction survives this door as it does the PSBT one; the
+                           transaction read here replaces the PSBT it holds. *@
+                        <partial name="SigningContext" for="SigningContext" />
+                        <p class="mb-2" text-translate="true">A signer that finalizes on the device hands back a transaction rather than a PSBT. There is nothing left to sign in one: it can only be broadcast as it stands.</p>
+                        <div class="form-group">
+                            <label for="ImportedTransaction" class="form-label" text-translate="true">Signed transaction</label>
+                            <textarea id="ImportedTransaction" name="SignedTransaction" class="form-control" rows="5"></textarea>
+                        </div>
+                        <div class="form-group">
+                            <label asp-for="UploadedTransactionFile" class="form-label"></label>
+                            <input asp-for="UploadedTransactionFile" type="file" class="form-control">
+                        </div>
+                        <button type="submit" name="command" value="decode-tx" class="btn btn-primary camera-submit-tx" id="DecodeTransaction" text-translate="true">Decode transaction</button>
                     </form>
                 </div>
             </div>

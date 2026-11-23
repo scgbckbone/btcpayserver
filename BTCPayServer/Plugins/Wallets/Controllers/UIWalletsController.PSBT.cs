@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Text;
 using System.Text.Encodings.Web;
 using System.Threading;
 using System.Threading.Tasks;
@@ -153,7 +154,7 @@ namespace BTCPayServer.Controllers
             var requiredPolicy = command switch
             {
                 "createpending" => WalletPolicies.CanCreateWalletTransactions,
-                "sign" or "collect" or "decode" or "save-psbt" or "update" or "combine" => WalletPolicies.CanSignWalletTransactions,
+                "sign" or "collect" or "decode" or "decode-tx" or "save-psbt" or "save-tx" or "update" or "combine" => WalletPolicies.CanSignWalletTransactions,
                 "broadcast" => WalletPolicies.CanBroadcastWalletTransactions,
                 _ => WalletPolicies.CanViewWallet
             };
@@ -167,6 +168,16 @@ namespace BTCPayServer.Controllers
 
             vm.NBXSeedAvailable = await CanAutoSignWithHotWallet(walletId);
             vm.BackUrl ??= HttpContext.Request.GetTypedHeaders().Referer?.AbsolutePath;
+
+            // The signed transaction has a box of its own, and it is a second door into
+            // this same decode: once read it is the PSBT that means the same thing, and
+            // nothing below this line can tell where it came from.
+            if (command == "decode-tx")
+            {
+                if (!await vm.ReadSignedTransaction(network.NBitcoinNetwork, ModelState))
+                    return View("WalletPSBT", vm);
+                command = "decode";
+            }
 
             vm.SigningContext.PSBT = vm.PSBT;
             var psbt = await vm.GetPSBT(network.NBitcoinNetwork, ModelState);
@@ -201,6 +212,22 @@ namespace BTCPayServer.Controllers
 
                 case "save-psbt":
                     return FilePSBT(psbt, vm.FileName);
+
+                case "save-tx":
+                    {
+                        // Hex text named after the transaction, which is the form a node's
+                        // sendrawtransaction, a block explorer's broadcast box and a signer's
+                        // own .txn file all take.
+                        var finalized = psbt.IsAllFinalized() ? psbt : psbt.Clone();
+                        if (!finalized.IsAllFinalized() && !finalized.TryFinalize(out var finalizeErrors))
+                        {
+                            vm.SetErrors(finalizeErrors);
+                            return View("WalletPSBT", vm);
+                        }
+                        var finalTransaction = finalized.ExtractTransaction();
+                        return File(Encoding.ASCII.GetBytes(finalTransaction.ToHex()),
+                            "application/octet-stream", $"{finalTransaction.GetHash()}.txn");
+                    }
 
                 case "update":
                     psbt = await ExplorerClientProvider.UpdatePSBT(derivationSchemeSettings, psbt);
@@ -258,6 +285,23 @@ namespace BTCPayServer.Controllers
             var psbtObject = PSBT.Parse(vm.SigningContext.PSBT, network.NBitcoinNetwork);
             if (!psbtObject.IsAllFinalized())
                 psbtObject = await ExplorerClientProvider.UpdatePSBT(derivationSchemeSettings, psbtObject) ?? psbtObject;
+            else if (psbtObject.Inputs.Any(input => input.GetTxOut() is null))
+            {
+                // A transaction that arrived already final carries no input values, so
+                // without this the screen asking the user to confirm a broadcast could
+                // show neither the fee nor what leaves the wallet. Only adopt the answer
+                // if it is still something we can broadcast, and show the transaction's
+                // own figures if NBXplorer will not say.
+                try
+                {
+                    var updated = await ExplorerClientProvider.UpdatePSBT(derivationSchemeSettings, psbtObject);
+                    if (updated?.IsAllFinalized() is true)
+                        psbtObject = updated;
+                }
+                catch (Exception)
+                {
+                }
+            }
             IHDKey signingKey = null;
             RootedKeyPath signingKeyPath = null;
 

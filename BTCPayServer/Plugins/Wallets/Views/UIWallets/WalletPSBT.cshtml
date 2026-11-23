@@ -24,6 +24,11 @@
     <script src="~/vendor/vue-qrcode-reader/VueQrcodeReader.umd.min.js" asp-append-version="true"></script>
 
     <script>
+        // A PSBT announces itself with its own magic bytes, so whatever the camera
+        // decoded — a static QR, a BBQr of either type, a UR — can be put in the box
+        // it belongs in rather than the box that happens to be first.
+        const PSBT_MAGIC = "70736274ff";
+        const isPSBT = value => typeof value === "string" && value.trim().toLowerCase().startsWith(PSBT_MAGIC);
         document.addEventListener("DOMContentLoaded", function () {
             const psbtHex = @Json.Serialize(Model.PSBTHex);
             if (psbtHex) {
@@ -47,12 +52,20 @@
                         hex = psbt.getPSBT().toString('hex');
                     } else {
                         console.error('Unexpected UR type', data.type)
+                        return;
                     }
                 } else if (typeof(data) === 'string') {
                     hex = data;
+                } else {
+                    return;
                 }
-                document.getElementById("PSBT").value = hex;
-                document.getElementById("Decode").click();
+                if (isPSBT(hex)) {
+                    document.getElementById("PSBT").value = hex;
+                    document.getElementById("Decode").click();
+                } else {
+                    document.getElementById("SignedTransaction").value = hex;
+                    document.getElementById("DecodeTransaction").click();
+                }
             }, "scanModal");
         });
     </script>
@@ -101,6 +114,26 @@
             }
             <button type="button" id="scanqrcode" class="btn btn-secondary only-for-js ms-3 mt-2" data-bs-toggle="modal" data-bs-target="#scanModal" text-translate="true">Scan wallet QR with camera</button>
         </div>
+    </form>
+</div>
+
+<div class="my-5">
+    <h2 class="h4" text-translate="true">Signed transaction</h2>
+    <p class="text-secondary" text-translate="true">A signer that finalizes on the device hands back a transaction rather than a PSBT. There is nothing left to sign in one: it can only be broadcast as it stands.</p>
+
+    <form class="form-group" method="post" asp-action="WalletPSBT" asp-route-walletId="@walletId" enctype="multipart/form-data">
+        <input type="hidden" asp-for="ReturnUrl" />
+        <input type="hidden" asp-for="BackUrl" />
+        <div class="form-group">
+            <label asp-for="SignedTransaction" class="form-label"></label>
+            <textarea class="form-control" rows="5" asp-for="SignedTransaction"></textarea>
+            <span asp-validation-for="SignedTransaction" class="text-danger"></span>
+        </div>
+        <div class="form-group">
+            <label asp-for="UploadedTransactionFile" class="form-label"></label>
+            <input asp-for="UploadedTransactionFile" type="file" class="form-control">
+        </div>
+        <button type="submit" name="command" value="decode-tx" class="btn btn-secondary mt-2" id="DecodeTransaction" permission="@WalletPolicies.CanSignWalletTransactions" text-translate="true">Decode transaction</button>
     </form>
 </div>
 <partial name="ShowQR"/>

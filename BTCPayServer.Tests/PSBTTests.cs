@@ -1,7 +1,10 @@
+using System.IO;
 using System.Linq;
+using System.Text;
 using System.Threading.Tasks;
 using BTCPayServer.Controllers;
 using BTCPayServer.Plugins.Wallets.Views.ViewModels;
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Mvc.ModelBinding;
 using NBitcoin;
@@ -56,6 +59,206 @@ namespace BTCPayServer.Tests
             Assert.Null(signingContext.ChangeAddress);
             Assert.Null(signingContext.Comment);
             Assert.Equal(0, signingContext.BalanceChangeFromReplacement);
+        }
+
+        [Fact]
+        [Trait("Fast", "Fast")]
+        public async Task ReadsASignedTransactionWhereAPSBTIsExpected()
+        {
+            // What a signer that finalizes on the device hands back: no PSBT, a
+            // transaction. The Greenfield broadcast endpoint has always taken either.
+            var network = Network.RegTest;
+            var signed = SignedTransaction(network, out var coin);
+
+            var vm = new WalletPSBTViewModel { SignedTransaction = signed.ToHex() };
+            var modelState = new ModelStateDictionary();
+            Assert.True(await vm.ReadSignedTransaction(network, modelState));
+            var psbt = await vm.GetPSBT(network, modelState);
+
+            Assert.NotNull(psbt);
+            Assert.True(vm.ProvidedTransaction);
+            Assert.True(psbt.IsAllFinalized());
+            // Nothing is lost on the way through: this is the transaction that will
+            // be broadcast, byte for byte, and the page offers exactly it.
+            Assert.Equal(signed.ToHex(), psbt.ExtractTransaction().ToHex());
+            Assert.Equal(signed.ToHex(), vm.TransactionHex);
+            Assert.Equal(signed.GetHash().ToString(), vm.TransactionId);
+            Assert.Equal(psbt.ToBase64(), vm.SigningContext.PSBT);
+            // A transaction does not carry what its inputs were worth, so the fee is
+            // not known here; the controller asks NBXplorer for the outpoints instead.
+            Assert.All(psbt.Inputs, input => Assert.Null(input.GetTxOut()));
+            Assert.Equal(coin.Outpoint, psbt.Inputs[0].PrevOut);
+        }
+
+        [Fact]
+        [Trait("Fast", "Fast")]
+        public async Task KeepsEveryShapeOfSignatureIntact()
+        {
+            // The signature of a legacy input lives in the scriptSig, a native segwit
+            // one in the witness, and a nested segwit one in both. Reading a transaction
+            // moves those fields into a PSBT, so what comes back out has to be the same
+            // bytes for every shape, not only the one a test happened to build.
+            var network = Network.RegTest;
+            var keys = new[] { new Key(), new Key(), new Key() };
+            var scriptPubKeys = new[]
+            {
+                keys[0].PubKey.GetAddress(ScriptPubKeyType.Legacy, network).ScriptPubKey,
+                keys[1].PubKey.GetAddress(ScriptPubKeyType.Segwit, network).ScriptPubKey,
+                keys[2].PubKey.GetAddress(ScriptPubKeyType.SegwitP2SH, network).ScriptPubKey
+            };
+            var funding = network.CreateTransaction();
+            foreach (var scriptPubKey in scriptPubKeys)
+                funding.Outputs.Add(Money.Coins(1.0m), scriptPubKey);
+            var coins = funding.Outputs.AsCoins().ToArray();
+
+            var signed = network.CreateTransactionBuilder()
+                .AddCoins(coins[0], coins[1])
+                .AddCoin(coins[2].ToScriptCoin(keys[2].PubKey.WitHash.ScriptPubKey))
+                .AddKeys(keys)
+                .Send(new Key().PubKey.GetAddress(ScriptPubKeyType.Segwit, network), Money.Coins(2.5m))
+                .SetChange(scriptPubKeys[1])
+                .SendEstimatedFees(new FeeRate(10m))
+                .BuildTransaction(sign: true);
+            Assert.Equal(3, signed.Inputs.Count);
+            Assert.Equal(2, signed.Inputs.Count(input => input.ScriptSig.Length > 0));
+            Assert.Equal(2, signed.Inputs.Count(input => input.WitScript != WitScript.Empty));
+
+            var vm = new WalletPSBTViewModel { SignedTransaction = signed.ToHex() };
+            var modelState = new ModelStateDictionary();
+            Assert.True(await vm.ReadSignedTransaction(network, modelState));
+            var psbt = await vm.GetPSBT(network, modelState);
+
+            Assert.NotNull(psbt);
+            Assert.True(psbt.IsAllFinalized());
+            Assert.Equal(signed.ToHex(), psbt.ExtractTransaction().ToHex());
+            Assert.Equal(signed.ToHex(), vm.TransactionHex);
+        }
+
+        [Fact]
+        [Trait("Fast", "Fast")]
+        public async Task ReadsASignedTransactionFromAnUploadedFile()
+        {
+            // Coldcard writes the finalized transaction as hex in a .txn file, and
+            // another signer may write its bytes; both arrive through the upload box.
+            var network = Network.RegTest;
+            var signed = SignedTransaction(network, out _);
+
+            foreach (var content in new[] { Encoding.ASCII.GetBytes(signed.ToHex() + "\n"), signed.ToBytes() })
+            {
+                var vm = new WalletPSBTViewModel
+                {
+                    UploadedTransactionFile = new FormFile(new MemoryStream(content), 0, content.Length, "file", "signed.txn")
+                };
+                var modelState = new ModelStateDictionary();
+                Assert.True(await vm.ReadSignedTransaction(network, modelState));
+                var psbt = await vm.GetPSBT(network, modelState);
+
+                Assert.NotNull(psbt);
+                Assert.True(vm.ProvidedTransaction);
+                Assert.Equal(signed.ToHex(), psbt.ExtractTransaction().ToHex());
+            }
+        }
+
+        [Fact]
+        [Trait("Fast", "Fast")]
+        public async Task KeepsEachBoxToItsOwnFormat()
+        {
+            // Neither box quietly swallows the other's format: a transaction cannot be
+            // signed, combined or updated, so a reader who pastes one where a PSBT is
+            // asked for is told which box it belongs in rather than left guessing.
+            var network = Network.RegTest;
+            var signed = SignedTransaction(network, out _);
+            var stripped = signed.Clone();
+            stripped.RemoveSignatures();
+            var source = PSBT.FromTransaction(stripped, network);
+
+            var psbtBox = new WalletPSBTViewModel { PSBT = signed.ToHex() };
+            var psbtBoxState = new ModelStateDictionary();
+            Assert.Null(await psbtBox.GetPSBT(network, psbtBoxState));
+            Assert.True(psbtBox.InvalidPSBT);
+            Assert.False(psbtBox.ProvidedTransaction);
+            Assert.Contains(psbtBoxState["PSBT"].Errors,
+                error => error.ErrorMessage == "This is a transaction, not a PSBT. Use the signed transaction box for it.");
+
+            var transactionBox = new WalletPSBTViewModel { SignedTransaction = source.ToBase64() };
+            var transactionBoxState = new ModelStateDictionary();
+            Assert.False(await transactionBox.ReadSignedTransaction(network, transactionBoxState));
+            Assert.True(transactionBox.InvalidTransaction);
+            Assert.Contains(transactionBoxState["SignedTransaction"].Errors,
+                error => error.ErrorMessage == "This is a PSBT, not a transaction. Use the PSBT box for it.");
+
+            var junk = new WalletPSBTViewModel { SignedTransaction = "not a transaction at all" };
+            var junkState = new ModelStateDictionary();
+            Assert.False(await junk.ReadSignedTransaction(network, junkState));
+            Assert.True(junk.InvalidTransaction);
+            Assert.Null(junk.TransactionHex);
+        }
+
+        [Fact]
+        [Trait("Fast", "Fast")]
+        public async Task OffersNoTransactionWhileSignaturesAreMissing()
+        {
+            // An unsigned PSBT has nothing to broadcast, so the page must not offer
+            // a transaction to download: there is none until it is signed.
+            var network = Network.RegTest;
+            var key = new Key();
+            var scriptPubKey = key.PubKey.GetAddress(ScriptPubKeyType.Segwit, network).ScriptPubKey;
+            var funding = network.CreateTransaction();
+            funding.Outputs.Add(Money.Coins(1.0m), scriptPubKey);
+            var unsigned = network.CreateTransactionBuilder()
+                .AddCoins(funding.Outputs.AsCoins().First())
+                .Send(new Key().PubKey.GetAddress(ScriptPubKeyType.Segwit, network), Money.Coins(0.5m))
+                .SetChange(scriptPubKey)
+                .SendEstimatedFees(new FeeRate(10m))
+                .BuildTransaction(sign: false);
+
+            var vm = new WalletPSBTViewModel { SignedTransaction = unsigned.ToHex() };
+            var modelState = new ModelStateDictionary();
+            Assert.True(await vm.ReadSignedTransaction(network, modelState));
+            var psbt = await vm.GetPSBT(network, modelState);
+
+            Assert.NotNull(psbt);
+            Assert.True(vm.ProvidedTransaction);
+            Assert.False(psbt.IsAllFinalized());
+            Assert.Null(vm.TransactionHex);
+        }
+
+        [Fact]
+        [Trait("Fast", "Fast")]
+        public async Task KeepsReadingPSBTs()
+        {
+            // The transaction fallback must not change what a PSBT does here.
+            var network = Network.RegTest;
+            var signed = SignedTransaction(network, out _);
+            var stripped = signed.Clone();
+            stripped.RemoveSignatures();
+            var source = PSBT.FromTransaction(stripped, network);
+
+            foreach (var content in new[] { source.ToBase64(), source.ToHex() })
+            {
+                var vm = new WalletPSBTViewModel { PSBT = content };
+                var psbt = await vm.GetPSBT(network, new ModelStateDictionary());
+
+                Assert.NotNull(psbt);
+                Assert.False(vm.ProvidedTransaction);
+                Assert.Equal(source.ToBase64(), psbt.ToBase64());
+            }
+        }
+
+        private static Transaction SignedTransaction(Network network, out Coin coin)
+        {
+            var key = new Key();
+            var scriptPubKey = key.PubKey.GetAddress(ScriptPubKeyType.Segwit, network).ScriptPubKey;
+            var funding = network.CreateTransaction();
+            funding.Outputs.Add(Money.Coins(1.0m), scriptPubKey);
+            coin = funding.Outputs.AsCoins().First();
+            return network.CreateTransactionBuilder()
+                .AddCoins(coin)
+                .AddKeys(key)
+                .Send(new Key().PubKey.GetAddress(ScriptPubKeyType.Segwit, network), Money.Coins(0.9m))
+                .SetChange(scriptPubKey)
+                .SendEstimatedFees(new FeeRate(10m))
+                .BuildTransaction(sign: true);
         }
 
         [Fact]
@@ -198,6 +401,36 @@ namespace BTCPayServer.Tests
             psbtParsed = PSBT.Parse(psbt, s.Server.NetworkProvider.BTC.NBitcoinNetwork);
             Assert.Single(psbtParsed.Inputs[0].HDKeyPaths);
             Assert.Single(psbtParsed.Inputs[0].PartialSigs);
+        }
+
+        [Fact]
+        [Trait("Playwright", "Playwright")]
+        public async Task CanBroadcastASignedTransaction()
+        {
+            // The round trip a signer that finalizes on the device forces: what comes
+            // back is a transaction, so it has to go in where a PSBT would.
+            await using var s = CreatePlaywrightTester(newDb: true);
+            await s.StartAsync();
+
+            await s.RegisterNewUser(true);
+            await s.CreateNewStore();
+            await s.GenerateWallet(isHotWallet: true);
+            var address = await s.FundStoreWallet();
+            await Task.Delay(1000);
+
+            await s.GoToWallet(navPages: Views.Wallets.WalletsNavPages.Send);
+            await SendAllTo(s, address);
+
+            // Signed, and the page offers the transaction itself rather than only the PSBT.
+            var transaction = await s.Page.Locator("#transaction-hex").TextContentAsync();
+            Assert.NotEmpty(transaction);
+
+            // Nothing has been broadcast yet: do it from the transaction alone.
+            await s.GoToWallet(s.WalletId, navPages: Views.Wallets.WalletsNavPages.PSBT);
+            await s.Page.Locator("[name='SignedTransaction']").FillAsync(transaction);
+            await s.Page.ClickAsync("#DecodeTransaction");
+            await s.Page.ClickAsync("#BroadcastTransaction");
+            await s.FindAlertMessage();
         }
 
         private static async Task SendAllTo(PlaywrightTester s, string address)

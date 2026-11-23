@@ -596,6 +596,55 @@ namespace BTCPayServer
             return transactions.Select(t => t.Result).Where(t => t != null).ToDictionary(o => o.Transaction.GetHash());
         }
 
+        /// <summary>
+        /// The same transaction, encoded as a PSBT.
+        /// </summary>
+        /// <remarks>
+        /// Two encodings of one thing, and BIP-174 puts the parts in different places:
+        /// a PSBT's global transaction carries no signatures at all, and each input
+        /// holds its complete scriptSig and witness in its own finalized fields. So
+        /// going from a transaction to a PSBT means moving those two fields per input,
+        /// nothing else. NBitcoin exposes it as a refusal plus a remedy — FromTransaction
+        /// rejects a transaction that still carries signatures and names
+        /// <see cref="Transaction.RemoveSignatures"/> in the message — which reads like
+        /// dismantling something, so the result is then checked rather than trusted: if
+        /// the PSBT does not extract back to the very bytes that came in, this throws
+        /// and the caller reports the transaction as unreadable. Nothing downstream ever
+        /// sees a transaction that is not the one the signer produced.
+        ///
+        /// The caller's transaction is not touched; the signatures are removed from a
+        /// clone, which is also why nothing a network adds to a transaction can be lost
+        /// here — only the library's own serialization is involved.
+        ///
+        /// Input values are not recovered, because a transaction does not carry them, so
+        /// a caller that needs the fee or the balance change still has to ask NBXplorer
+        /// for the outpoints it knows.
+        /// </remarks>
+        /// <exception cref="InvalidOperationException">
+        /// The PSBT does not extract back to the transaction that came in.
+        /// </exception>
+        public static PSBT ToPSBT(this Transaction transaction, Network network)
+        {
+            ArgumentNullException.ThrowIfNull(transaction);
+            var unsigned = transaction.Clone();
+            unsigned.RemoveSignatures();
+            var psbt = PSBT.FromTransaction(unsigned, network);
+            for (var i = 0; i < transaction.Inputs.Count; i++)
+            {
+                var input = transaction.Inputs[i];
+                if (input.ScriptSig is { Length: > 0 })
+                    psbt.Inputs[i].FinalScriptSig = input.ScriptSig;
+                if (input.WitScript is { } witScript && witScript != WitScript.Empty)
+                    psbt.Inputs[i].FinalScriptWitness = witScript;
+            }
+            // Only a fully signed transaction can be extracted, and it is the only one
+            // that could be broadcast, so it is the one worth proving. A partly signed
+            // one still needs a signer, and that path checks it again on the way out.
+            if (psbt.IsAllFinalized() && psbt.ExtractTransaction().ToHex() != transaction.ToHex())
+                throw new InvalidOperationException("This transaction cannot be read as a PSBT without changing it.");
+            return psbt;
+        }
+
         public static async Task<PSBT?> UpdatePSBT(this ExplorerClientProvider explorerClientProvider, DerivationSchemeSettings derivationSchemeSettings, PSBT psbt)
         {
             var result = await explorerClientProvider.GetExplorerClient(psbt.Network.NetworkSet.CryptoCode).UpdatePSBTAsync(new UpdatePSBTRequest()
